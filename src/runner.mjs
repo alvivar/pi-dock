@@ -1,0 +1,425 @@
+import { randomBytes } from 'node:crypto';
+import { appendFileSync, readFileSync, truncateSync } from 'node:fs';
+import path from 'node:path';
+import { parseArgs } from 'node:util';
+import {
+  createAgentSessionFromServices,
+  createAgentSessionServices,
+  initTheme,
+  SessionManager,
+} from '@earendil-works/pi-coding-agent';
+import { ManifestExistsError, readManifest, writeManifest } from './manifest.mjs';
+import { ensureDockDir, logPath, pipePath } from './paths.mjs';
+import { serve } from './pipe.mjs';
+
+const { values } = parseArgs({
+  options: {
+    name: { type: 'string' },
+    cwd: { type: 'string' },
+    model: { type: 'string' },
+    thinking: { type: 'string' },
+    x: { type: 'string', multiple: true },
+    create: { type: 'boolean' },
+  },
+});
+
+const name = values.name;
+
+const log = logPath(name);
+const pipe = pipePath(name);
+let session;
+let server;
+let unsubscribe = () => {};
+let current;
+let runError;
+let compacting = false;
+const queued = new Set();
+let terminal = false;
+// Set once bindExtensions has completed; only a shutdown that begins after that emits
+// session_shutdown.
+let bound = false;
+let queue = Promise.resolve();
+// Settles once the runner is ready or terminal; pipe requests that arrive earlier wait for it.
+let settleStartup;
+const startup = new Promise((resolve) => {
+  settleStartup = resolve;
+});
+
+function appendLog(event) {
+  appendFileSync(log, `${JSON.stringify({ ts: new Date().toISOString(), ...event })}\n`, 'utf8');
+}
+
+// A final line cut short (power loss, full disk) would merge with this boot's first event into a
+// complete but invalid line, so the owner drops it. A missing log stays missing.
+function dropTornTail() {
+  let body;
+  try {
+    body = readFileSync(log);
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return;
+    }
+    throw error;
+  }
+
+  const end = body.lastIndexOf('\n') + 1;
+  if (end < body.length) {
+    truncateSync(log, end);
+  }
+}
+
+function parseExtensionFlags(flags) {
+  return new Map(flags.map((flag) => {
+    const equals = flag.indexOf('=');
+    return equals === -1 ? [flag, true] : [flag.slice(0, equals), flag.slice(equals + 1)];
+  }));
+}
+
+function thinkingOption(level) {
+  return level ? { thinkingLevel: level } : {};
+}
+
+function textFromMessage(message) {
+  return message.content
+    .filter((part) => part.type === 'text')
+    .map((part) => part.text)
+    .join('')
+    .trim();
+}
+
+function closeServerThenExit(code) {
+  if (!server?.listening) {
+    process.exit(code);
+  }
+
+  server.close(() => process.exit(code));
+}
+
+async function shutdown(event, details, code) {
+  if (terminal) {
+    return;
+  }
+
+  terminal = true;
+  settleStartup();
+  const dropped = [...queued];
+  const interrupted = current;
+  // Read before abort's await, during which a pending bindExtensions could still complete.
+  const extensionsBound = bound;
+  unsubscribe();
+  await session?.abort().catch(() => {});
+  // As Pi does on quit, on the now idle session. Handlers are awaited without a limit, so one that
+  // never settles keeps the runner from exiting. The SDK catches a handler's error and passes it
+  // to the onError listeners without a catch of its own; ours returns at once now that terminal
+  // is set, so the error is dropped and nothing is thrown here.
+  if (extensionsBound) {
+    await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
+  }
+  session?.dispose();
+  if (dropped.length > 0) {
+    appendLog({ event: 'dropped', ids: dropped });
+  }
+  appendLog({ event, ...(interrupted && { id: interrupted }), ...details });
+  closeServerThenExit(code);
+}
+
+function fail(error) {
+  return shutdown('failed', { reason: error.message }, 1);
+}
+
+function stopSoon() {
+  return shutdown('stopped', {}, 0);
+}
+
+function subscribeToSession() {
+  unsubscribe = session.subscribe((event) => {
+    if (terminal) {
+      return;
+    }
+
+    if (event.type === 'turn_start') {
+      appendLog({ event: 'turn', ...(current && { id: current }) });
+      return;
+    }
+
+    // A custom message entered the context: through the agent loop (message_start), or as an
+    // entry an extension appended at a turn boundary (entry_appended). Type only, never content.
+    if (event.type === 'message_start' && event.message.role === 'custom') {
+      appendLog({ event: 'external', ...(current && { id: current }), type: event.message.customType });
+      return;
+    }
+    if (event.type === 'entry_appended' && event.entry.type === 'custom_message') {
+      appendLog({ event: 'external', ...(current && { id: current }), type: event.entry.customType });
+      return;
+    }
+
+    if (event.type === 'turn_end') {
+      if (current) {
+        const { stopReason, errorMessage } = event.message;
+        runError = stopReason === 'error' || stopReason === 'aborted' ? errorMessage || stopReason : undefined;
+      }
+      const text = textFromMessage(event.message);
+      if (text) {
+        appendLog({ event: 'text', ...(current && { id: current }), text });
+      }
+      return;
+    }
+
+    // Every compaction's one outcome, whoever started it: pi-dock compact, an extension or the
+    // SDK's automatic compaction. compaction_end may come without a compaction_start.
+    if (event.type === 'compaction_end') {
+      const id = current && { id: current };
+      try {
+        if (event.result) {
+          appendLog({ event: 'compacted', ...id });
+        } else if (event.aborted) {
+          appendLog({ event: 'compact_cancelled', ...id });
+        } else {
+          appendLog({ event: 'compact_failed', ...id, reason: event.errorMessage });
+        }
+      } catch (error) {
+        // Thrown into the SDK, the error would turn into a failed compaction and the runner would
+        // carry on. It fails instead, as when it cannot log a prompt's outcome; if it cannot log
+        // that either, the unhandled rejection crashes it.
+        void fail(error);
+      }
+    }
+  });
+}
+
+async function runOnePrompt(id, text) {
+  // Idle extension work finishes first and keeps no id; until then the prompt stays queued.
+  await session.waitForIdle();
+  if (terminal) {
+    return;
+  }
+
+  queued.delete(id);
+  current = id;
+  runError = undefined;
+  try {
+    appendLog({ event: 'run', id });
+    await session.prompt(text, { streamingBehavior: 'followUp' });
+    // A prompt that joined an already streaming run returns at once; its outcome is that run's.
+    await session.waitForIdle();
+    if (!terminal) {
+      appendLog(runError === undefined ? { event: 'done', id } : { event: 'run_failed', id, reason: runError });
+    }
+  } catch (error) {
+    await fail(error);
+  } finally {
+    current = undefined;
+  }
+}
+
+function runPrompt(text) {
+  if (terminal) {
+    return undefined;
+  }
+
+  const id = `p${randomBytes(6).toString('hex')}`;
+  // Log first: a failed write rejects the request and leaves no phantom queued prompt.
+  appendLog({ event: 'queued', id });
+  queued.add(id);
+  // Nothing handles the queue: a task can reject only if fail() itself fails, and that crashes
+  // the runner instead of stalling the prompts behind it.
+  queue = queue.then(() => runOnePrompt(id, text));
+  return id;
+}
+
+function busyForCompact() {
+  return current || compacting || queued.size > 0 || session.isStreaming || session.isCompacting;
+}
+
+// Replies only: the session subscription logs the outcome, as for every compaction.
+async function runOneCompact(instructions) {
+  try {
+    await session.compact(instructions);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  } finally {
+    compacting = false;
+  }
+}
+
+function runCompact(instructions) {
+  if (terminal) {
+    return { ok: false, error: 'terminal' };
+  }
+  if (busyForCompact()) {
+    return { ok: false, error: 'busy' };
+  }
+
+  compacting = true;
+  const task = queue.then(() => runOneCompact(instructions));
+  // The pipe handles task; this unhandled tail crashes the runner if task rejects, as for prompts.
+  queue = task.then(() => undefined);
+  return task;
+}
+
+function findModel(modelRuntime, spec) {
+  const slash = spec.indexOf('/');
+  if (slash === -1) {
+    throw new Error(`model not found: ${spec}`);
+  }
+
+  const provider = spec.slice(0, slash);
+  const id = spec.slice(slash + 1);
+  const model = modelRuntime.getModel(provider, id);
+  if (!model) {
+    throw new Error(`model not found: ${spec}`);
+  }
+
+  return model;
+}
+
+try {
+  await ensureDockDir();
+
+  // Only --create creates: a wake whose manifest is gone fails instead of starting a new agent.
+  const createMode = values.create;
+  const existing = createMode ? null : await readManifest(name);
+  const cwd = createMode ? path.resolve(values.cwd ?? process.cwd()) : existing.cwd;
+  const flags = createMode ? values.x ?? [] : existing.flags;
+  const thinking = createMode ? values.thinking : existing.thinking;
+
+  // Own the pipe before opening the session or loading extensions, so that of concurrent runners
+  // for one agent only the owner does either.
+  server = serve(pipe, async (msg) => {
+    await startup;
+    if (msg.cmd === 'status') {
+      if (terminal) {
+        return { ok: false, error: 'terminal' };
+      }
+
+      // compacting reserves the runner until its own compact settles (the SDK clears isCompacting
+      // earlier); isCompacting adds compactions others started, such as an extension's.
+      const state = compacting || session.isCompacting
+        ? 'compacting'
+        : current || session.isStreaming ? 'running' : 'idle';
+      return { ok: true, state, model: `${session.model.provider}/${session.model.id}`, pid: process.pid };
+    }
+
+    if (msg.cmd === 'prompt') {
+      const id = runPrompt(msg.text);
+      return id ? { ok: true, id } : { ok: false, error: 'terminal' };
+    }
+
+    if (msg.cmd === 'compact') {
+      return runCompact(msg.instructions);
+    }
+
+    if (msg.cmd === 'stop') {
+      setImmediate(() => {
+        void stopSoon();
+      });
+      return { ok: true, pid: process.pid };
+    }
+
+    return { ok: false, error: 'unknown' };
+  });
+  server.on('error', (error) => {
+    if (error.piDockRetrying) {
+      return;
+    }
+    if (error.code === 'EADDRINUSE') {
+      // Another runner owns this agent: leave its log, manifest and session untouched.
+      process.exit(0);
+    }
+
+    void fail(error);
+  });
+  await new Promise((resolve) => {
+    server.once('listening', resolve);
+  });
+  dropTornTail();
+  // Logged as soon as this runner owns the agent, so its PID is known even if startup hangs.
+  appendLog({ event: 'spawned', pid: process.pid });
+
+  const services = await createAgentSessionServices({
+    cwd,
+    extensionFlagValues: parseExtensionFlags(flags),
+  });
+  const modelSpec = createMode ? values.model : existing.model;
+  const model = modelSpec ? findModel(services.modelRuntime, modelSpec) : undefined;
+  // The session file is written only after the first message; without the cwd override, opening
+  // a missing one would start a session in the waker's cwd instead of the agent's.
+  const sessionManager = createMode
+    ? SessionManager.create(cwd)
+    : SessionManager.open(existing.sessionFile, undefined, cwd);
+  let extensionsResult;
+  ({ session, extensionsResult } = await createAgentSessionFromServices({
+    services,
+    sessionManager,
+    ...(model ? { model } : {}),
+    ...thinkingOption(thinking),
+  }));
+
+  if (createMode) {
+    const resolvedModel = model ?? session.model;
+    if (!resolvedModel) {
+      session.dispose();
+      session = undefined;
+      throw new Error('no model with usable credentials available');
+    }
+    const manifest = {
+      name,
+      sessionFile: session.sessionFile,
+      cwd,
+      model: `${resolvedModel.provider}/${resolvedModel.id}`,
+      flags,
+      pipe,
+      startedAt: new Date().toISOString(),
+    };
+    if (thinking) {
+      manifest.thinking = thinking;
+    }
+    try {
+      await writeManifest(name, manifest);
+    } catch (error) {
+      if (error instanceof ManifestExistsError) {
+        session.dispose();
+        process.exit(0);
+      }
+      throw error;
+    }
+  }
+
+  // The SDK returns extensions that failed to load instead of reporting them to onError. Like a
+  // handler's error, each is only logged; the agent goes on without that extension.
+  for (const { path: extension, error } of extensionsResult.errors) {
+    appendLog({ event: 'extension_error', extension, on: 'load', reason: error });
+  }
+
+  subscribeToSession();
+  // Without a uiContext the SDK uses its own no-op UI, so ctx.hasUI is false. That UI still
+  // exposes the SDK's global theme, which throws until initialized; extensions such as pi-link
+  // read it. No file watcher: nothing renders.
+  initTheme();
+  await session.bindExtensions({
+    mode: 'print',
+    shutdownHandler: () => {
+      void stopSoon();
+    },
+    // The SDK catches a handler's throw and the agent carries on; only the log records it.
+    onError: ({ extensionPath, event, error }) => {
+      // Like session events: once shutdown begins, nothing may follow the terminal event.
+      if (terminal) {
+        return;
+      }
+      appendLog({
+        event: 'extension_error',
+        ...(current && { id: current }),
+        extension: extensionPath,
+        on: event,
+        reason: error,
+      });
+    },
+  });
+  bound = true;
+
+  settleStartup();
+} catch (error) {
+  await fail(error);
+}

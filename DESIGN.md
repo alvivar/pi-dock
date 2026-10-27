@@ -251,7 +251,7 @@ with that event into a complete but invalid line. Readers do not skip corrupt li
 
 ## Verified
 
-Windows: regression passes on every change; the paid smoke passed 50/50 at 2e6644f on 0.2.0
+Windows: regression passes on every change; the paid smoke passed 50/50 on 0.2.0
 (2026-10-01, `openai-codex/gpt-6.1-sol`). Unix: inspected, not runtime-tested.
 Real usage: RV lab (2026-08-18) — 3 residents, ~145 piped prompts, ~50 min, zero tool
 failures.

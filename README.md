@@ -107,8 +107,8 @@ pi-dock stop w1
   then reads `running` or `compacting`); spawn never takes a prompt.
 - `send --wait` queues the prompt, prints its id (`p` + 12 hex) on stderr, and prints the run's
   final text on stdout once it is done.
-- `logs` shows what happened; `show` prints the agent's name, state, model, thinking, flags, cwd,
-  session file and creation time.
+- `logs` shows what happened; `show` prints the agent's name, state, model, thinking, flags,
+  system prompt size, tools, cwd, session file and creation time.
 - `stop` powers the agent off and prints `w1 stopped`. `pi-dock send w1 "…"` or
   `pi-dock start w1` wakes it again, with the conversation intact.
 
@@ -121,7 +121,7 @@ compacts `w1` with the instructions `--help`. For usage, run the top-level `pi-d
 
 | Command | What it does |
 | --- | --- |
-| `spawn --name <name> [--model <provider/id>] [--thinking <level>] [--x key[=value]]...` | Create an idle agent in the current directory |
+| `spawn --name <name> [--model <provider/id>] [--thinking <level>] [--system-prompt <file>] [--tools <a,b> \| --no-tools] [--x key[=value]]...` | Create an idle agent in the current directory |
 | `send <name> [--wait] [--file <path>] [--] [text...]` | Queue a prompt and print its id; `--wait` also waits for the result |
 | `wait <name> <id>` | Wait for a prompt's run and print its final text |
 | `start <name>` | Wake a stopped or failed agent |
@@ -129,7 +129,7 @@ compacts `w1` with the instructions `--help`. For usage, run the top-level `pi-d
 | `ls` | List agents: `name state model age` |
 | `show <name>` | Print one agent's details, one key and value per line |
 | `logs <name> [--tail <n>] [--raw] [--follow]` | Print the agent's event log |
-| `set <name> [--model <provider/id>] [--thinking <level>] [--x key[=value]]...` | Change a powered-off (stopped or failed) agent's configuration |
+| `set <name> [--model <provider/id>] [--thinking <level>] [--system-prompt <file>] [--tools <a,b> \| --no-tools] [--x key[=value]]...` | Change a powered-off (stopped or failed) agent's configuration |
 | `compact <name> [instructions]` | Compact an idle agent's session |
 | `models [filter]` | List the models you can use |
 | `skill` | Print the operating guide for AI agents |
@@ -150,7 +150,7 @@ which does not tell whether it is alive. Neither wakes it.
 
 `stop` is a power-off, not a delete. The name, configuration, log and session survive, and
 `start`, `send` and `compact` wake the agent with its memory. pi-dock has no command that
-deletes an agent.
+deletes an agent; see [Deleting an agent](#deleting-an-agent) to do it by hand.
 
 `pi-dock stop w1 w2 w3` stops a team. It checks the whole list first, so an invalid, unknown or
 repeated name stops nothing. Then it stops the agents one after another and prints one line per
@@ -182,14 +182,60 @@ Long prompts are easier with `--file prompt.md`. Prompts run one at a time, in o
 - `--thinking off|minimal|low|medium|high|xhigh|max` is applied on every wake. Without it, Pi
   restores the session's saved level or uses its configured default; levels the model does not
   support are clamped by Pi.
-- `pi-dock set` changes model, thinking and extension flags, only while the agent is powered
-  off (stopped or failed); the next wake applies them.
+- `pi-dock set` changes model, thinking, system prompt, tools and extension flags, only while
+  the agent is powered off (stopped or failed); the next wake applies them. Run `stop`, `set`
+  and `start` one after another, with no other command on that agent in between: `set` checks
+  that the agent is off and then rewrites its manifest, so a `start` in between runs the old
+  configuration until the next restart (nothing is lost), and two `set`s at once can each undo
+  the other's change.
+
+### System prompt and tools
+
+Each agent can have its own role and tool set, instead of a per-folder `.pi/SYSTEM.md` or
+`defaultTools`:
+
+```bash
+pi-dock spawn --name reader --system-prompt ./reviewer.md --tools read,grep
+pi-dock spawn --name thinker --system-prompt ./thinker.md --no-tools
+```
+
+- `--system-prompt <file>` replaces Pi's base prompt, as `pi --system-prompt` does, and wins
+  over `.pi/SYSTEM.md` in the agent's directory. What Pi adds to the base prompt still
+  applies: `APPEND_SYSTEM.md`, `AGENTS.md` context and the working directory. Skills follow
+  Pi's usual rule: they are listed only when the agent's tools include `read` or `bash`. The
+  path is relative to where you run the command.
+- `spawn` and `set` refuse a file that cannot be read or is blank before they start or change
+  anything. The runner reads the file again; if it has become unreadable or blank in between,
+  startup fails with the reason in the log, and no manifest is written, so no agent exists.
+- The agent keeps a copy of the content, not the path: editing or deleting the file changes
+  nothing. To change the prompt, `stop`, `set --system-prompt <file>`, `start`.
+- `--tools a,b` enables exactly these tools, built-in or from extensions, and replaces Pi's
+  defaults (read, bash, edit, write), so list every tool the agent needs. Names are exact:
+  `*`, `+name` and `-name` are refused. `--no-tools` enables none. The list applies on every
+  wake, whatever tools the session used before.
+- An unknown name, or the tool of an extension that is not installed, fails startup before a
+  manifest is written, so a spawn leaves no agent, only its log. The handshake
+  failure shows `tools not found: …` in the last log line. `set` checks only the syntax, so
+  after a `set` the next wake fails the same way.
+- It is not a sandbox. Extensions whose tools are not listed stay loaded and keep running:
+  pi-link stays connected without its `link_*` tools, so name `link_send` and the others if
+  the agent should reply. pi-dock never adds tools to the list.
+- pi-dock does not load Pi's built-in MCP and codemode extensions, and `--tools` installs
+  nothing: `codemode` or `mcp__…` names fail unless an extension provides them. A list without
+  `mcp__` entries leaves the MCP tools extensions register reachable indirectly (through
+  codemode or tool search). A list that names any `mcp__` tool keeps only the MCP tools it
+  names, and `--no-tools` removes them all.
+- `show` prints `system-prompt <N> bytes` and the tools (`none` after `--no-tools`, `-` when
+  unset), never the prompt itself. `set` replaces either one; going back to Pi's defaults is
+  not possible yet.
 
 ### Extension flags and pi-link
 
 `--x key[=value]` passes a flag to the extensions the agent loads, the same as `--key value` on
 the `pi` command line. pi-dock does not interpret them, and they do nothing without the
-extension that defines them. `set --x` replaces the whole list.
+extension that defines them. `set --x` replaces the whole list. A flag that no loaded extension
+defines, or a value flag given without its value, is not applied: each boot logs it as a
+`diagnostic` event, and the agent runs without it.
 
 With pi-link installed in Pi, this spawns an agent that joins the link and requests the link
 name `reviewer` (pi-link may suffix a taken name, e.g. `reviewer-2`):
@@ -217,10 +263,14 @@ itself starts.
   `pi-dock start <name>`.
 - **`agent <name> did not exit within 5s; terminate PID <pid> externally`**: `stop` asked the
   agent to exit and it did not, e.g. because an extension's `session_shutdown` handler, which
-  the agent waits for as Pi does on quit, never finished. Terminate that process, then check
-  `pi-dock ls`.
-- **`handshake failed for <name>`**: a spawned or woken agent did not answer within 20 s. The
-  printed diagnostics include the last log line, if any.
+  the agent waits for as Pi does on quit, never finished. Check that the PID's command line
+  contains `runner.mjs --name <name>` (PIDs are reused), terminate that process, and confirm it
+  has exited before starting the agent again or deleting its files: while it shuts down,
+  `pi-dock ls` can show `failed` and `pi-dock stop` can print `already stopped` or
+  `already failed`.
+- **`handshake failed for <name>`**: a spawned or woken agent's runner exited with an error, or
+  the agent did not answer within 20 s. The printed diagnostics include the last log line, if
+  any.
 - **`lock: ~/.pi/dock/<name>.sock.lock exists`** (Unix, after a failed handshake): a runner
   holds this directory while it takes the agent's socket, and removes it once it listens. If
   it remains, a runner is acquiring the socket right now, or one was killed while it did or
@@ -384,16 +434,49 @@ agents load it on their own when a task involves pi-dock. For other AI tools, ha
 Names are lowercase `a-z0-9` segments joined by single `.`, `_` or `-`, at most 64 characters,
 and not a Windows device name such as `con` or `nul`.
 
+### Opening an agent's session in Pi
+
+The session is an ordinary Pi session, so Pi opens it by the path `pi-dock show <name>` prints:
+
+```bash
+pi --fork <session file>      # a copy, as a new session in the current directory
+pi --session <session file>   # the agent's own conversation; stop the agent first
+```
+
+- `--fork` leaves the agent untouched and needs no stop: use it to read the conversation or
+  continue it separately.
+- `--session` continues the agent's own session, in the agent's directory. Stop the agent
+  first and don't wake it until you quit Pi: while both run, they append to the same file
+  without seeing each other's entries. `pi --continue` or `pi --resume` in the agent's
+  directory can pick its session too.
+- What you add in Pi becomes part of the agent's memory: the next wake continues from there.
+  Pi runs the session with its own prompt, tools and extensions; the agent's next wake applies
+  its manifest again, and what the manifest does not set (e.g. thinking without `--thinking`)
+  follows the session, as on any wake.
+
+### Deleting an agent
+
+To remove an agent by hand:
+
+```bash
+pi-dock show w1   # note the session file, if you also want the conversation gone
+pi-dock stop w1   # must print "stopped", "already stopped" or "already failed"
+rm ~/.pi/dock/w1.json ~/.pi/dock/w1.log
+rm <session file> # optional
+```
+
+Stop it first: without its manifest pi-dock no longer knows the agent, so it cannot stop a
+runner that is still on. If `stop` reported `did not exit within 5s`, follow
+[Recovery](#recovery) first and confirm the runner process has exited. Remove the log too: a
+new agent with the same name would otherwise append to the old one. On Unix, also remove
+`~/.pi/dock/w1.sock` if it is there.
+
 ## Status and limitations
 
-- **Version 0.4.2.**
+- **Version 0.5.2.**
 - **Windows** is verified: the regression suite on every change, and the paid end-to-end smoke
   test against a real model. **Unix** (sockets, signals) is little tested: on Linux (WSL)
   only the regression's socket acquisition cases pass, and the suite does not yet run
   through; the smoke test has not been run on Linux, macOS or Android (Termux).
 - **Lockfile:** `package-lock.json` reproduces this checkout's dependencies. It does not pin the
   transitive dependencies of anyone who installs pi-dock some other way.
-- **Source checkout only** (not in the npm package): design and contracts in `DESIGN.md`, and
-  the tests, run from the checkout: `node test/regression.mjs` (free, no model calls);
-  `node test/smoke.mjs <provider/id> [thinking]` makes real, paid calls to that model, with
-  Pi's default thinking unless a level is given.

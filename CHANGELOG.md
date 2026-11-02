@@ -8,6 +8,67 @@ this checkout, dated by the day it was completed. None of the versions documente
 
 ---
 
+## 0.5.2 — 2026-11-01
+
+### Changed
+
+- **The docs explain how to open an agent's session in Pi and how to delete an agent.**
+  The README shows `pi --fork` and `pi --session` with the file `show` prints, and that the
+  agent must be stopped before its own session is opened. It also gives the manual steps to
+  delete an agent, since pi-dock has no command for it. The skill states the rules and links
+  there.
+- **The skill is shorter and keeps only what an agent needs to operate pi-dock.** It drops
+  output formats the commands show themselves and logging internals, and moves the warnings
+  up. It now says that stored settings cannot be unset, that only `set` must not overlap other
+  changes or wakes, which `wait` failures may have done part of the work, and to delete an
+  agent only after a successful `stop`.
+- **After a `stop` timeout, the docs have you confirm that the runner process exited.** They
+  said to terminate the PID and then check `pi-dock ls`, but while that runner is still
+  shutting down `ls` can show `failed` and `stop` can print `already stopped` or
+  `already failed`. README and skill now say to confirm the process has exited before starting
+  the agent again or deleting its files.
+
+---
+
+## 0.5.1 — 2026-11-01
+
+### Changed
+
+- **The docs correct how `--tools` treats MCP tools and add two cautions.** README and skill
+  said only `--no-tools` removes the MCP tools extensions register; a list that names any
+  `mcp__` tool also keeps only the MCP tools it names. The skill now has agents check that a
+  PID's command line contains `runner.mjs --name <name>` before terminating it, as the README
+  does, and both say that `stop`, `set` and `start` on one agent must not overlap with other
+  commands on it.
+
+### Fixed
+
+- **A runner that fails startup no longer leaves the command waiting 20 s.** `spawn`, and
+  `start`, `send` and `compact` when they wake an agent, stop waiting as soon as the runner
+  they launched exits with an error, such as an unknown `--tools` name, and print the
+  handshake diagnostics at once. A manifest that exists but cannot be read fails with its
+  own error instead of the generic handshake failure.
+- **Startup problems Pi reports are now logged.** An `--x` flag that no loaded extension
+  defines, a value flag given without its value, and a provider or model an extension failed
+  to register were dropped without a trace. Each boot now logs them as `diagnostic` events.
+  A diagnostic does not itself stop startup; a failure it explains, such as a missing model,
+  still does, and the log now shows the cause before `failed`.
+
+---
+
+## 0.5.0 — 2026-10-31
+
+### Added
+
+- **Per-agent system prompt and tools.** `spawn` and `set` take `--system-prompt <file>`, which
+  replaces Pi's base prompt as `pi --system-prompt` does, and `--tools a,b` or `--no-tools`,
+  an exact tool list applied on every wake. The agent stores the prompt's content, so the file
+  can change or go. A tool no extension provides fails startup before the agent exists; `set`
+  checks it at the next wake. `show` prints the prompt's size and the tools. It is not a
+  sandbox: extensions whose tools are not listed stay loaded.
+
+---
+
 ## 0.4.2 — 2026-10-27
 
 ### Fixed

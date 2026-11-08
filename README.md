@@ -41,7 +41,7 @@ Each agent is one detached process hosting one Pi session, identified by a name 
 
 - Node.js **22.19 or later** (required by the Pi SDK).
 - Pi set up with credentials for at least one model. pi-dock runs agents with its own copy of the
-  Pi SDK (`@earendil-works/pi-coding-agent` 1.4.0) but uses your Pi agent directory
+  Pi SDK (`@earendil-works/pi-coding-agent` 1.5.0) but uses your Pi agent directory
   (`~/.pi/agent`, or `PI_CODING_AGENT_DIR`) for credentials, settings, models and extensions.
   `pi-dock models` lists only the models whose credentials are configured.
 - The `pi` command is needed to set up credentials and to install pi-dock for Pi (below).
@@ -68,13 +68,6 @@ install it globally:
 npm i -g pi-dock           # optional
 npm uninstall -g pi-dock   # undo
 ```
-
-`npm audit` flags undici (GHSA-4qv8-2p9j-2685, GHSA-f72v-6w45-q472, GHSA-xjj6-f33q-929c; fixed
-in 8.12.2) through the Pi SDK, which pins undici 8.10.2. pi-dock can't override it for you:
-npm ignores `overrides` in an installed package, and `npm audit fix --force` would downgrade
-the SDK to 0.75.3. Exploiting them takes a malicious HTTP or SSE response on an affected
-undici API path; Pi 1.4.0 pins the same vulnerable undici version. The warning goes away once
-pi-dock moves to an SDK that ships a fixed undici.
 
 For development, install it from a checkout of this directory:
 
@@ -121,7 +114,7 @@ compacts `w1` with the instructions `--help`. For usage, run the top-level `pi-d
 
 | Command | What it does |
 | --- | --- |
-| `spawn --name <name> [--model <provider/id>] [--thinking <level>] [--system-prompt <file>] [--tools <a,b> \| --no-tools] [--x key[=value]]...` | Create an idle agent in the current directory |
+| `spawn --name <name> [--fork <path\|id>] [--model <provider/id>] [--thinking <level>] [--system-prompt <file>] [--tools <a,b> \| --no-tools] [--x key[=value]]...` | Create an idle agent in the current directory |
 | `send <name> [--wait] [--file <path>] [--] [text...]` | Queue a prompt and print its id; `--wait` also waits for the result |
 | `wait <name> <id>` | Wait for a prompt's run and print its final text |
 | `start <name>` | Wake a stopped or failed agent |
@@ -177,8 +170,8 @@ Long prompts are easier with `--file prompt.md`. Prompts run one at a time, in o
 ### Models and thinking
 
 - `--model provider/id` takes a ref from `pi-dock models`. Without it, Pi's default model is
-  used. An unknown model (the error suggests matches) or one without credentials fails before
-  anything is created.
+  used, or with `--fork` the source's model if it has credentials. An unknown model (the error
+  suggests matches) or one without credentials fails before an agent or a copy is created.
 - `--thinking off|minimal|low|medium|high|xhigh|max` is applied on every wake. Without it, Pi
   restores the session's saved level or uses its configured default; levels the model does not
   support are clamped by Pi.
@@ -228,6 +221,36 @@ pi-dock spawn --name thinker --system-prompt ./thinker.md --no-tools
 - `show` prints `system-prompt <N> bytes` and the tools (`none` after `--no-tools`, `-` when
   unset), never the prompt itself. `set` replaces either one; going back to Pi's defaults is
   not possible yet.
+
+### Forking a session
+
+`spawn --fork` starts the agent with a copy of an existing Pi session, as `pi --fork` does:
+another agent's, one you ran in Pi, or that of the agent that runs the spawn.
+
+```bash
+pi-dock spawn --name w2 --fork <session file>   # e.g. the file pi-dock show w1 prints
+pi-dock spawn --name w2 --fork <session id>
+```
+
+- The source is a path if it contains `/` or `\`, or ends in `.jsonl`, relative to where you
+  run the command; otherwise an exact session id, looked up in Pi's session directory, this
+  directory's sessions first, then every project's. A prefix of an id is not enough. A path or
+  id that is not found fails before an agent or a copy is created.
+- The copy is a new session in the current directory: every entry of the source, under a new
+  id, with a header that names the source as `parentSession`. The source is only read, so the
+  agent or Pi that runs it may go on; the copy holds the complete entries the file held at
+  that moment. (`pi --fork` ends an incomplete last line of the source with a newline; pi-dock
+  leaves that line out of the copy.)
+- Without `--model`, the agent uses the source's model if it has credentials, otherwise Pi's
+  default; spawn prints the one it got. Thinking and tools follow the session unless
+  `--thinking`, `--tools` or `--no-tools` set them. A system prompt is not part of a session:
+  only `--system-prompt` sets one, as on any spawn.
+- An agent can fork its own conversation: in its bash commands, `$PI_SESSION_FILE` is its
+  session file and `$PI_SESSION_ID` its id. The copy then ends at the tool call that runs
+  `pi-dock spawn`, which has no result, so the new agent sees that call as failed (`No result
+  provided`). Tell it in its first prompt that it is the fork.
+- If startup fails before the agent exists (e.g. `tools not found`), the copy is removed. Once
+  the agent exists, the copy is its session; `--fork` is a spawn option only.
 
 ### Extension flags and pi-link
 
@@ -443,8 +466,11 @@ pi --fork <session file>      # a copy, as a new session in the current director
 pi --session <session file>   # the agent's own conversation; stop the agent first
 ```
 
-- `--fork` leaves the agent untouched and needs no stop: use it to read the conversation or
-  continue it separately.
+- `--fork` opens a copy as a separate session: use it to read the conversation or continue it
+  separately. Pi ends an incomplete last line of the file it forks with a newline, a write to
+  the agent's session if the agent is writing at that moment, so stop the agent first or fork a
+  copy of its file. `pi-dock spawn --fork` only reads the session; see
+  [Forking a session](#forking-a-session).
 - `--session` continues the agent's own session, in the agent's directory. Stop the agent
   first and don't wake it until you quit Pi: while both run, they append to the same file
   without seeing each other's entries. `pi --continue` or `pi --resume` in the agent's
@@ -473,7 +499,7 @@ new agent with the same name would otherwise append to the old one. On Unix, als
 
 ## Status and limitations
 
-- **Version 0.5.2.**
+- **Version 0.6.0.**
 - **Windows** is verified: the regression suite on every change, and the paid end-to-end smoke
   test against a real model. **Unix** (sockets, signals) is little tested: on Linux (WSL)
   only the regression's socket acquisition cases pass, and the suite does not yet run

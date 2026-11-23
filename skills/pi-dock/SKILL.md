@@ -14,24 +14,32 @@ Commands here are written as `pi-dock …`. If `pi-dock` is not on your PATH (Pi
 packages without putting their commands there), run the package's `bin/pi-dock.mjs` with Node
 and the same arguments instead: `node "<this skill's directory>/../../bin/pi-dock.mjs" …`.
 
-Every command exits 0 on success and 1 on error, with the reason on stderr. Arguments are strict:
-unknown options and extra arguments fail with the command's usage line, except `compact`, which
-takes all remaining arguments (even `--help`) as instructions. Run `pi-dock --help` for the usage
-of every command.
+Every command exits 0 on success and 1 on error, with the reason on stderr. The arguments of a
+command are strict: an argument error (an unknown option, an extra or missing argument, an
+invalid name or value) prints the command's usage line, sometimes on its own. Errors met while
+running the command print no usage line. When the agent refuses `start`, `send` or `stop`, the
+error is `agent <name> refused <command>: <reply>`. Run `pi-dock --help` for the usage of every
+command.
 
 ## Warnings
 
 - Agents load `<cwd>/.pi` config and extensions WITHOUT asking for project trust. Spawn only in
   directories you trust.
 - There are NO limits: no turn, time or cost cap. An agent runs until stop or a crash, and work
-  that extensions deliver while it is idle (e.g. pi-link messages) is unbounded too. Stop agents
-  you no longer need.
+  that extensions deliver while it is idle (e.g. pi-link messages) is unbounded too. Even an
+  idle agent that gets no prompt can make billable requests: Pi keeps its prompt cache warm for
+  up to 30 minutes after its last real request (a completed refresh logs `cache_warmed`);
+  `"cacheWarming": "streaming"` in Pi's global settings, set before the agent starts, prevents
+  these idle refreshes. Pi can still refresh the cache during a run while the next request is
+  slow to come (e.g. a long tool call); `"off"` prevents those too. Stop agents you no longer
+  need.
 
 ## Workflow
 
 1. `pi-dock models [filter]` — when you need to choose a model: lists the `provider/id` refs
-   that have configured credentials. The filter is a case-insensitive substring of
-   `provider/id`, or `provider-part/id-part`.
+   that have configured credentials. Matching is case-insensitive. A ref matches if it contains
+   the filter, so a whole ref works too. A filter with `/` also matches if the provider contains
+   the part before the first `/` and the model id the rest.
 2. `pi-dock spawn --name <name> [--fork <path|id>] [--model <provider/id>] [--thinking <level>]
    [--system-prompt <file>] [--tools <a,b> | --no-tools] [--x key[=value]]...`
    — create the agent in the current directory. It takes no prompt and prints
@@ -46,7 +54,7 @@ of every command.
      which it sees as failed: say in its first prompt that it is the fork. See
      [Forking a session](../../README.md#forking-a-session).
    - `--thinking` is `off|minimal|low|medium|high|xhigh|max` and is applied on every wake.
-     Without it, the session's saved level or Pi's default applies.
+     Without it, Pi uses the saved level or its default. Pi clamps unsupported levels.
    - Names are lowercase `a-z0-9` segments joined by single `.`, `_` or `-`, at most 64
      characters; Windows device names are reserved. Invalid names are rejected, never
      normalized. A name that exists fails with `agent already exists: <name>`.
@@ -85,17 +93,23 @@ of every command.
 
 ## States and waking
 
-- `idle`, `running` or `compacting` while the runner answers; otherwise `stopped` after a stop,
-  or `failed` after a crash or fatal error. `not-responding` means the runner did not answer in
-  time: whether it is alive is unknown.
+- `idle`, `running` or `compacting` while the runner answers; `stopping` while the runner is
+  shutting down, after a stop or a fatal error; otherwise `stopped` after a stop, or `failed`
+  after a crash or fatal error. `not-responding` means the runner did not answer: whether it is
+  alive is unknown.
 - `pi-dock ls` lists the agents and their states. `pi-dock show <name>` prints one agent's state,
   stored configuration and exact session file; there `-` means unset, tools `none` means
   `--no-tools`, and the system prompt appears only as its size. Neither wakes the agent.
+- `ls` and `show` print the stored model, which every wake reapplies. `spawn` and `start` print
+  the model in use, including any change an extension has already made.
 - Agents are resident: a runner never exits because work finished, only on stop or a crash.
 - `start`, `send` and `compact` wake a stopped or failed agent with its memory intact. `start`
   prints `<name> <state> <provider/id>`; on an agent that is already on it just prints that.
-- If the agent stops or crashes mid-request, `start`, `send` and `compact` report
-  `agent <name> stopped or crashed during <cmd>` instead of waking or retrying.
+- In `start`, `send`, `compact` or `stop`, `agent <name> <command> request failed: <error>`
+  means the request failed for a reason other than a timeout (e.g. the connection closed before
+  a reply, or the reply was not JSON). The CLI does not retry. The error does not tell you
+  whether the runner received the request or exited. Before repeating it, check `pi-dock ls`
+  and `pi-dock logs <name>`. For `send`, `queued` records the id of an accepted prompt.
 - `pi-dock stop <name>...` checks the whole list first: an invalid, unknown or repeated name
   fails and stops nothing. Then it stops the agents one after another and prints one line per
   name: `<name> stopped` only once its runner process has exited, or `<name> already stopped` /
@@ -105,23 +119,25 @@ of every command.
 
 ## Changing an agent
 
-- `pi-dock set <name> [--model <provider/id>] [--thinking <level>] [--system-prompt <file>]
-  [--tools <a,b> | --no-tools] [--x key[=value]]...` works only on a stopped or failed agent
-  (`agent <name> is running — stop it first` otherwise). The model is preflighted like
-  spawn's. Each option replaces its stored value, and `--x` replaces the entire flag list; an
-  option left out keeps it. There is no option to unset thinking, system prompt or tools, or to
-  clear the whole flag list. The next wake applies the change; name, session, cwd and creation
-  time never change.
+- `pi-dock set <name> (--model <provider/id> | --thinking <level> | --system-prompt <file> |
+  --tools <a,b> | --no-tools | --x key[=value])...` takes at least one option and works only on
+  a stopped or failed agent (`agent <name> is running — stop it first` otherwise). The model is
+  preflighted like spawn's. Each option replaces its stored value, and `--x` replaces the entire
+  flag list; an option left out keeps it. There is no option to unset thinking, system prompt or
+  tools, or to clear the whole flag list. The next wake applies the change; name, session, cwd
+  and creation time never change.
 - Serialize changes per agent: a successful `stop`, then `set`, then `start`. Do not overlap
   `set` with another `set`, or with `start`, `send` or `compact`, on the same agent.
 - `--x key[=value]` flags are passed opaquely to extensions and are inert without them. A flag
   no loaded extension defines, or a value flag without its value, is not applied and is logged
   as a `diagnostic` event.
-- `pi-dock compact <name> [instructions]` compacts the session. It requires an idle agent with
+- `pi-dock compact <name> [--] [instructions...]` compacts the session and prints
+  `<name> compacted`. The instructions are the remaining arguments joined by spaces; `--` ends
+  options, so they may start with `-`. It requires an idle agent with
   no queued prompts and no compaction in progress, including one an extension started (`agent
   <name> is busy` otherwise). It wakes an off agent and leaves it on, and waits without a
-  timeout; Ctrl-C only stops waiting, not the compaction. A failed compaction exits 1 with its
-  reason.
+  timeout; Ctrl-C only stops waiting, not the compaction. A failed compaction exits 1 with
+  `agent <name> compaction failed: <reason>`.
 
 ## Role and tools
 
@@ -163,6 +179,9 @@ compacted / compact_failed reason / compact_cancelled   (all id?)
                                a compaction ended, whoever started it; it never ends the run
 external id? type              a custom extension message of this type entered the context
                                (pi-link: link)
+cache_warmed id?               Pi re-sent the last request to keep its prompt cache warm, a
+                               billable request; a cancelled, failed or outdated refresh logs
+                               nothing, so this is not a full record of spending
 extension_error extension on reason
                                an extension handler for event `on` threw, or (on load) the
                                extension failed to load and the agent runs without it
@@ -188,14 +207,17 @@ diagnostic type message        at boot, a problem Pi reported while loading, e.g
   `pi-dock logs <name>`, check that PID's command line contains `runner.mjs --name <name>`
   (PIDs are reused), terminate it externally, then run `pi-dock start <name>`. Do not retry in
   a loop.
-- `agent <name> did not exit within 5s; terminate PID <pid> externally`: check that PID's
+- `agent <name> did not exit within 5s; PID <pid> is still shutting down`: the runner may still
+  be saving a refreshed login, so check again whether that PID has exited before terminating
+  it; terminating it then can invalidate the login. If it is still running, check that its
   command line contains `runner.mjs --name <name>` (PIDs are reused), terminate it, and confirm
-  that process has exited before starting the agent again or deleting its files: `pi-dock ls`
-  can show `failed`, and `pi-dock stop` can print `already stopped`/`already failed`, while that
-  process is still shutting down.
+  that process has exited before starting the agent again or deleting its files: once it has
+  closed its pipe, `pi-dock ls` can show `stopped` or `failed`, and `pi-dock stop` can print
+  `already stopped`/`already failed`, while that process is still shutting down.
 - `handshake failed for <name>`: a spawned or woken runner exited with an error, or did not
   answer status within 20 s.
-  Read the printed manifest and log diagnostics and the `last log` line, if present. A
+  Read the printed manifest and log diagnostics and the `last log` line, if present;
+  `pi-dock logs <name>` prints the whole log, even when the spawn created no agent. A
   `lock: <path> exists` line (Unix) means a runner is acquiring the socket, or one was killed
   while it did or could not remove it; the agent cannot start until it is removed. Remove that
   directory only after no process whose command line contains `runner.mjs --name <name>` is

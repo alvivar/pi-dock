@@ -309,13 +309,17 @@ function modelRef({ provider, id }) {
   return `${provider}/${id}`;
 }
 
+// A model matches if its ref contains the filter, which finds a pasted ref even when the provider
+// id has a slash. A filter with a slash also matches the provider and id parts separately.
 async function matchingModels(modelRuntime, filter) {
   const query = filter.toLowerCase();
   const slash = query.indexOf('/');
+  const matches = (model) => modelRef(model).toLowerCase().includes(query)
+    || (slash !== -1
+      && model.provider.toLowerCase().includes(query.slice(0, slash))
+      && model.id.toLowerCase().includes(query.slice(slash + 1)));
   return (await modelRuntime.getAvailable())
-    .filter((model) => (slash === -1
-      ? modelRef(model).toLowerCase().includes(query)
-      : model.provider.toLowerCase().includes(query.slice(0, slash)) && model.id.toLowerCase().includes(query.slice(slash + 1))))
+    .filter(matches)
     .sort((a, b) => (modelRef(a) < modelRef(b) ? -1 : 1));
 }
 
@@ -329,8 +333,8 @@ async function preflightSpawn(cwd, modelSpec, forkFile) {
   const modelRuntime = await ModelRuntime.create();
 
   if (modelSpec !== undefined) {
-    const slash = modelSpec.indexOf('/');
-    const model = slash === -1 ? null : modelRuntime.getModel(modelSpec.slice(0, slash), modelSpec.slice(slash + 1));
+    // The whole ref, not a split at the first slash: provider ids may contain one.
+    const model = modelRuntime.getModels().find((candidate) => modelRef(candidate) === modelSpec);
     if (!model) {
       const matches = (await matchingModels(modelRuntime, modelSpec)).map(modelRef);
       const hint = matches.length === 0

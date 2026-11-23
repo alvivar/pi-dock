@@ -11,22 +11,22 @@ import { acquisitionLock, PIPE_REQUEST_TIMEOUT_MS, request } from '../src/pipe.m
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const runner = path.join(root, 'src', 'runner.mjs');
-const command = process.argv[2] === '-h' ? '--help' : process.argv[2];
+const command = process.argv[2];
 const args = process.argv.slice(3);
 const USAGE = {
   spawn: 'pi-dock spawn --name <name> [--fork <path|id>] [--model <provider/id>] [--thinking <level>] [--system-prompt <file>] [--tools <a,b> | --no-tools] [--x key[=value]]...',
-  send: 'pi-dock send <name> [--wait] [--file <path>] [--] [text...]',
+  send: 'pi-dock send <name> [--wait] (--file <path> | [--] <text>...)',
   wait: 'pi-dock wait <name> <id>',
   start: 'pi-dock start <name>',
   stop: 'pi-dock stop <name>...',
   ls: 'pi-dock ls',
   logs: 'pi-dock logs <name> [--tail <n>] [--raw] [--follow]',
   show: 'pi-dock show <name>',
-  set: 'pi-dock set <name> [--model <provider/id>] [--thinking <level>] [--system-prompt <file>] [--tools <a,b> | --no-tools] [--x key[=value]]...',
-  compact: 'pi-dock compact <name> [instructions]',
+  set: 'pi-dock set <name> (--model <provider/id> | --thinking <level> | --system-prompt <file> | --tools <a,b> | --no-tools | --x key[=value])...',
+  compact: 'pi-dock compact <name> [--] [instructions...]',
   models: 'pi-dock models [filter]',
   skill: 'pi-dock skill',
-  '--help': 'pi-dock [--help | -h]',
+  '--help': 'pi-dock [--help]',
 };
 // Shutdown aborts the current run (in-flight request, running tools) before exiting; that normally takes well under a second.
 const STOP_EXIT_TIMEOUT_MS = 5000;
@@ -52,7 +52,7 @@ function parseCommand(argv, options, maxPositionals) {
     failUsage(`Unexpected argument '${parsed.positionals[maxPositionals]}'`);
   }
   // An explicit empty value is likely an unset variable in a script, never "use the default".
-  for (const option of ['fork', 'model', 'thinking', 'system-prompt', 'tools']) {
+  for (const option of ['fork', 'model', 'thinking', 'system-prompt', 'tools', 'file']) {
     if (parsed.values[option] === '') {
       failUsage(`Option '--${option}' must not be empty`);
     }
@@ -112,9 +112,18 @@ function processAlive(pid) {
   }
 }
 
+// An invalid name is a mistake in what the user typed, so it fails with the usage line.
+function validateName(name) {
+  try {
+    return validateAgentName(name);
+  } catch (error) {
+    failUsage(error.message);
+  }
+}
+
 function validateThinking(level) {
   if (level !== undefined && !VALID_THINKING_LEVELS.has(level)) {
-    fail(`invalid thinking level: ${level}`);
+    failUsage(`invalid thinking level: ${level}`);
   }
 }
 
@@ -168,7 +177,11 @@ async function resolveForkSource(value) {
   if (value.includes('/') || value.includes('\\') || value.endsWith('.jsonl')) {
     const file = path.resolve(value);
     // A check for clear errors only: the runner reads the file when it forks.
-    await access(file);
+    try {
+      await access(file);
+    } catch (error) {
+      fail(`cannot access fork source ${value}: ${error.message}`);
+    }
     return file;
   }
   const { SessionManager } = await import('@earendil-works/pi-coding-agent');
@@ -410,19 +423,16 @@ function formatAge(startedAt) {
   return `${seconds}s`;
 }
 
-// A timeout means the runner did not answer in time; whether it is alive is unknown.
+// Only consult the log when no runner is listening. Any other failure, a timeout included,
+// leaves unknown whether it is alive. Our runner refuses status only once it is shutting down.
 async function agentState(manifest) {
+  let status;
   try {
-    const status = await request(manifest.pipe, { cmd: 'status' }, 200);
-    if (status.ok) {
-      return status.state;
-    }
+    status = await request(manifest.pipe, { cmd: 'status' }, 200);
   } catch (error) {
-    if (isTimeout(error)) {
-      return 'not-responding';
-    }
+    return pipeAbsent(error) ? stateFromLog(manifest.name) : 'not-responding';
   }
-  return stateFromLog(manifest.name);
+  return status.ok ? status.state : 'stopping';
 }
 
 function renderEvent(line) {
@@ -443,7 +453,7 @@ async function spawnCommand(argv) {
   if (values.name === undefined) {
     failUsage();
   }
-  const name = validateAgentName(values.name);
+  const name = validateName(values.name);
 
   validateThinking(values.thinking);
   const tools = parseTools(values);
@@ -495,11 +505,12 @@ async function wake(manifest) {
   return result;
 }
 
-function failRequest(name, cmd, error) {
+// Names the command the user ran, not the request it sent.
+function failRequest(name, error) {
   if (isTimeout(error)) {
     failNotResponding(name);
   }
-  fail(`agent ${name} stopped or crashed during ${cmd}`);
+  fail(`agent ${name} ${command} request failed: ${error.message}`);
 }
 
 async function deliver(manifest, msg, timeoutMs) {
@@ -508,16 +519,30 @@ async function deliver(manifest, msg, timeoutMs) {
     reply = await request(manifest.pipe, msg, timeoutMs);
   } catch (error) {
     if (!pipeAbsent(error)) {
-      failRequest(manifest.name, msg.cmd, error);
+      failRequest(manifest.name, error);
     }
   }
 
   if (reply === undefined || reply.error === 'terminal') {
     const { manifest: woken } = await wake(manifest);
-    reply = await request(woken.pipe, msg, timeoutMs).catch((error) => failRequest(manifest.name, msg.cmd, error));
+    reply = await request(woken.pipe, msg, timeoutMs).catch((error) => failRequest(manifest.name, error));
   }
 
   return reply;
+}
+
+// The --file contents. An empty file is only known once read, so it fails without the usage line.
+function readPromptFile(file) {
+  let text;
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch (error) {
+    fail(`cannot read prompt file ${file}: ${error.message}`);
+  }
+  if (text.length === 0) {
+    fail('empty prompt');
+  }
+  return text;
 }
 
 async function sendCommand(argv) {
@@ -529,8 +554,8 @@ async function sendCommand(argv) {
     failUsage();
   }
 
-  validateAgentName(name);
-  const text = values.file === undefined ? words.join(' ') : readFileSync(values.file, 'utf8');
+  validateName(name);
+  const text = values.file === undefined ? words.join(' ') : readPromptFile(values.file);
   if (text.length === 0) {
     failUsage('empty prompt');
   }
@@ -538,7 +563,7 @@ async function sendCommand(argv) {
   const manifest = await requireManifest(name);
   const reply = await deliver(manifest, { cmd: 'prompt', text }, PIPE_REQUEST_TIMEOUT_MS);
   if (!reply.ok) {
-    fail(JSON.stringify(reply));
+    fail(`agent ${name} refused send: ${JSON.stringify(reply)}`);
   }
   if (!values.wait) {
     console.log(reply.id);
@@ -616,7 +641,7 @@ async function waitCommand(argv) {
     failUsage();
   }
 
-  validateAgentName(name);
+  validateName(name);
   await waitForPrompt(await requireManifest(name), id);
 }
 
@@ -626,10 +651,10 @@ async function startCommand(argv) {
     failUsage();
   }
 
-  validateAgentName(name);
+  validateName(name);
   const status = await deliver(await requireManifest(name), { cmd: 'status' }, PIPE_REQUEST_TIMEOUT_MS);
   if (!status.ok) {
-    fail(`agent ${name} refused status: ${JSON.stringify(status)}`);
+    fail(`agent ${name} refused start: ${JSON.stringify(status)}`);
   }
   console.log(`${name} ${status.state} ${status.model}`);
 }
@@ -690,7 +715,7 @@ async function showCommand(argv) {
     failUsage();
   }
 
-  validateAgentName(name);
+  validateName(name);
   const manifest = await requireManifest(name);
   console.log([
     `name ${manifest.name}`,
@@ -716,7 +741,7 @@ async function logsCommand(argv) {
   const { values, positionals: [name] } = parseCommand(argv, {
     tail: { type: 'string' },
     raw: { type: 'boolean' },
-    follow: { type: 'boolean', short: 'f' },
+    follow: { type: 'boolean' },
   }, 1);
   if (name === undefined) {
     failUsage();
@@ -725,9 +750,10 @@ async function logsCommand(argv) {
     failUsage(`Option '--tail' must be a positive integer, got '${values.tail}'`);
   }
 
-  validateAgentName(name);
-  await requireManifest(name);
+  validateName(name);
+  // The log alone, so a spawn that failed before it wrote the manifest can still be read.
   if (!existsSync(logPath(name))) {
+    await requireManifest(name);
     fail(`no log for agent: ${name}`);
   }
 
@@ -768,7 +794,7 @@ async function setCommand(argv) {
     failUsage();
   }
 
-  validateAgentName(name);
+  validateName(name);
   validateThinking(values.thinking);
   const tools = parseTools(values);
   const systemPrompt = await readSystemPromptOption(values);
@@ -801,23 +827,23 @@ async function setCommand(argv) {
 }
 
 async function compactCommand(argv) {
-  const [name, ...instructionParts] = argv;
+  const { positionals: [name, ...words] } = parseCommand(argv, {}, Infinity);
   if (name === undefined) {
     failUsage();
   }
 
-  const instructions = instructionParts.join(' ');
-  validateAgentName(name);
+  const instructions = words.join(' ');
+  validateName(name);
   const msg = instructions.length > 0 ? { cmd: 'compact', instructions } : { cmd: 'compact' };
   const reply = await deliver(await requireManifest(name), msg, null);
   if (!reply.ok) {
     if (reply.error === 'busy') {
       fail(`agent ${name} is busy`);
     }
-    fail(reply.error);
+    fail(`agent ${name} compaction failed: ${reply.error}`);
   }
 
-  console.log('compacted');
+  console.log(`${name} compacted`);
 }
 
 // Returns the outcome to print after the name; throws on an operational failure, whose message
@@ -834,7 +860,7 @@ async function stopAgent({ name, pipe }) {
     if (isTimeout(error)) {
       throw new Error('is not responding');
     }
-    throw error;
+    throw new Error(`stop request failed: ${error.message}`);
   }
   if (!reply.ok) {
     throw new Error(`refused stop: ${JSON.stringify(reply)}`);
@@ -859,9 +885,9 @@ async function stopCommand(argv) {
   // The whole list is checked before anything is stopped, so a typo cannot cause a partial power-off.
   const manifests = [];
   for (const [index, name] of names.entries()) {
-    validateAgentName(name);
+    validateName(name);
     if (names.indexOf(name) !== index) {
-      fail(`duplicate agent name: ${name}`);
+      failUsage(`duplicate agent name: ${name}`);
     }
     manifests.push(await requireManifest(name));
   }
@@ -902,8 +928,8 @@ Essentials:
   Agents are resident. spawn creates an idle agent in the current directory; send queues a prompt
   and prints its id; wait <name> <id>, or send --wait, prints the run's final text. stop powers the
   agent off and keeps its memory; start, send and compact wake it again. ls and show report the
-  state (idle, running, compacting, stopped, failed or not-responding), logs the event log. Every
-  command exits 0 on success and 1 on error.
+  state (idle, running, compacting, stopping, stopped, failed or not-responding), logs the event
+  log. Every command exits 0 on success and 1 on error.
 
 Warnings:
   Agents load <cwd>/.pi config and extensions WITHOUT asking for project trust.

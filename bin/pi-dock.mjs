@@ -839,7 +839,7 @@ async function stopAgent({ name, pipe }) {
   const deadline = Date.now() + STOP_EXIT_TIMEOUT_MS;
   while (processAlive(reply.pid)) {
     if (Date.now() > deadline) {
-      throw new Error(`did not exit within ${STOP_EXIT_TIMEOUT_MS / 1000}s; terminate PID ${reply.pid} externally`);
+      throw new Error(`did not exit within ${STOP_EXIT_TIMEOUT_MS / 1000}s; PID ${reply.pid} is still shutting down`);
     }
     await sleep(50);
   }

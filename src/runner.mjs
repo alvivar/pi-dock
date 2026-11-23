@@ -116,7 +116,7 @@ async function shutdown(event, details, code) {
   // Read before abort's await, during which a pending bindExtensions could still complete.
   const extensionsBound = bound;
   unsubscribe();
-  // Not expected to reject: in SDK 1.5.0, abort() signals the run, retry and compaction to stop,
+  // Not expected to reject: in SDK 1.6.0, abort() signals the run, retry and compaction to stop,
   // then awaits idle, which only resolves. Should it reject, shutdown still ends in its terminal
   // event, which would not mention the failed abort.
   await session?.abort().catch(() => {});
@@ -128,6 +128,9 @@ async function shutdown(event, details, code) {
     await session.extensionRunner.emit({ type: 'session_shutdown', reason: 'quit' });
   }
   session?.dispose();
+  // As Pi does on exit: an OAuth refresh in progress may already have spent the old refresh token,
+  // so exiting before the new one is saved would lose the login. Waits without a limit.
+  await session?.modelRuntime.settleCredentialWrites();
   if (dropped.length > 0) {
     appendLog({ event: 'dropped', ids: dropped });
   }
@@ -162,6 +165,12 @@ function subscribeToSession() {
     }
     if (event.type === 'entry_appended' && event.entry.type === 'custom_message') {
       appendLog({ event: 'external', ...(current && { id: current }), type: event.entry.customType });
+      return;
+    }
+    // Pi re-sent the last request to keep its prompt cache warm, a billable request. Not the
+    // cost: Pi prices it at API rates, which a subscription does not pay.
+    if (event.type === 'entry_appended' && event.entry.type === 'usage' && event.entry.kind === 'cache_warm') {
+      appendLog({ event: 'cache_warmed', ...(current && { id: current }) });
       return;
     }
 
@@ -400,8 +409,8 @@ try {
   // to register. Logged at once, so a later startup failure (say, the model that provider
   // supplies is not found) keeps the cause. Pi's CLI exits on such an error; a diagnostic does
   // not itself stop an agent, as with a flag whose extension is not loaded.
-  // Pi's CLI also reports each extension package warning as a diagnostic. Since SDK 1.5.0 this
-  // includes a package that could not be installed, which the agent then runs without.
+  // Pi's CLI also reports each extension package warning as a diagnostic, such as a package
+  // that could not be installed, which the agent then runs without.
   const packageWarnings = (services.resourceLoader.getExtensions().warnings ?? []).map(({ path: source, warning }) => ({
     type: 'warning',
     message: `Extension package "${source}": ${warning}`,
